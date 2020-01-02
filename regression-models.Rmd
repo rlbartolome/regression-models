@@ -1,0 +1,410 @@
+---
+title: "STAT 218 Analytics Project III"
+author: "Inigo Benavides and Rommel Bartolome"
+date: "March 23, 2019"
+abstract: "We created two models using a dataset collection of 300 sampled water districts in the Philippines. The first model is a regression model with water prices as the output variable while the second one is a categorical  model where we created an output variable called wastage rating. The Ridge, Lasso, and Principal Components Regression were employed in creating the models. It has been found that the best model for the regression model is the Lasso Regression Model, with an RMSE of 0.253. On the other hand, the Principal Components Regression Model has been found to be the best model for classification with an AUC of 0.509 and 54% Accuracy."
+output: pdf_document
+---
+
+# Introduction
+
+For our third analytics project, we were given the same dataset similar to the first and second project. The data set is comprised of 300 sampled water districts in the Philippines. The specific locations of the water districts have been anonymised and no reference year is provided. There was no autocorrelation, and we will assume that there would be no spatial correlation between districts.
+
+With the same data, we will be creating two models. The first model would be a regression model with the water prices as output variable while the second model would be a categorical model where we created a new output variable called `wastage rating`. For the `wastage rating`, if the percent of non-revenue water from total displaced water (`nrwpercent`) is less than or equal 25, we label it as 1 and 0 otherwise
+
+However, in this project, we will now be employing another set of modelling tools. We will be using Ridge Regression, Lasso Regression and Principal Components Regression. From these three, we will check which has the lowest RMSE and the best accuracy.
+
+# Data Loading and Cleaning
+
+Before creating our models, we load all the libraries we will be using in this project:
+
+```{r setup, include=FALSE}
+library("tidyverse")
+library("glmnet")
+library("caret")
+library("splines")
+library("gam")
+library("pROC")
+library("pls")
+```
+
+Similar to our previous project, we will also clean our data and set our seed for reproducibility. Here, we factorize necessary variables and based on previous work, we transform and take the logarithm of `conn` (number of connections in a water district), `vol_nrw` (volume of non-revenue water in cu.m., which is displaced water in which the water district did not collect revenues) and `wd_rate` (water rate in pesos for a specific water district, as minimum charge for the first 10 cu. m.). We also simplify `Mun1` (number of first-class municipalities in the water district) as a binary decision while `conn_p_area` (number of connections per square kilometre) was squared. Lastly, the wastage rating which we will call as  `nrwpcent_class` is added for the classfication model. 
+
+```{r message=FALSE, warning=FALSE}
+set.seed(1)
+df <- read_csv("data_BaBe.csv") %>%
+  select(-c(X1)) %>%
+  mutate(REGION=as.factor(REGION),
+         WD.Area=as.factor(WD.Area),
+         Mun1=as.factor(case_when(Mun1 > 0 ~ 1, TRUE ~ 0)),
+         conn_log=log(conn),
+         vol_nrw_log=log(vol_nrw),
+         wd_rate_log=log(wd_rate),
+         conn_p_area_squared=conn_p_area^2,
+         nrwpcent_class=as.factor(case_when(nrwpcent <= 25 ~ 1, TRUE ~ 0))
+         # Engineer target classification variable
+         )
+```
+
+We also created a dummified version of the feature matrix, which we will use later in the classification part. The data was split into a train and a test dataset.
+
+```{r}
+# Create dummified version of feature matrix
+df_dummies <- dummyVars(~ ., data=df, fullRank=TRUE) %>% predict(df) %>% as.data.frame()
+colnames(df_dummies)[length(df_dummies)] <- "nrwpcent_class"
+df_dummies_train <- df_dummies[1:250,]
+df_dummies_test <- df_dummies[251:300,]
+
+# Train test split first 250 vs. last 50
+df_train <- df[1:250,]
+df_test <- df[251:300,]
+```
+
+In the following sections, we will explore the fitting of the following models to our water district data set: (1) Ridge Regression, (2) Lasso Regression, and (3) Principal Components Regression. The first part will be for the Regression Model while the latter parts will be for the Categorical Model.
+  
+# Regression Model
+
+## Ridge Regression
+
+For the purpose of this project, we created a helper function called `formulaConstructor` that we will use in coercing our data to the suited form. We also separated the $x$ and the $y$ so we can easily fit it in the regression model later.
+
+```{r}
+formulaConstructor <- function(predictors) {
+  predictors %>% paste(collapse=" + ") %>% paste("wd_rate ~", .) %>% as.formula()
+}
+
+predictors <- df_train %>% select(-c(wd_rate, wd_rate_log)) %>% names
+
+X_train <- model.matrix(formulaConstructor(predictors), df_train)
+y_train <- df_train$wd_rate
+
+X_test <- model.matrix(formulaConstructor(predictors), df_test)
+y_test <- df_test$wd_rate
+
+```
+
+Now, we first perform cross validation, so we can choose the value of the tuning parameter lambda.
+
+```{r}
+grid <- 10^seq(10, -2, length=100)
+cv_ridge_regression_model <- cv.glmnet(X_train, y_train, alpha=0, lambda=grid)
+plot(cv_ridge_regression_model)
+```
+
+The plot above shows that mean-squared error with respect to the log of lambda.
+
+```{r}
+cv_ridge_regression_model$lambda.min
+```
+Based on the above plot, we find that the optimal value of $\lambda$ that minimizes cross-validation MSE is 305.3856. We also inspecting the model's path coefficients below:
+
+```{r}
+plot(cv_ridge_regression_model$glmnet.fit, "lambda", label=FALSE)
+```
+
+We now check the performance of the Ridge Regression Model with respect to the train set:
+
+```{r}
+# Fit ridge regression model with optimal lambda
+optimal_lambda <- cv_ridge_regression_model$lambda.min
+ridge_regression_model <- glmnet(X_train, y_train, alpha=0, lambda = optimal_lambda)
+
+# Compute MSE
+predictions <- ridge_regression_model %>% predict(X_test) %>% as.vector()
+sqrt(mean((predictions - y_test)^2)) / (mean(y_test))
+```
+
+We find that our ridge regression model has a test RMSE of 0.2661241.
+
+```{r}
+ridge_regression_model_coefs <- ridge_regression_model %>% 
+  predict(type="coefficients", s=optimal_lambda) %>% as.matrix()
+ridge_regression_model_coefs[order(ridge_regression_model_coefs, decreasing=TRUE), ]
+```
+
+In terms of the resulting coefficients, we find that `REGIONCAR`, `REGIONI`, `REGIONCARAGA` have the largest positive contribution to `wd_rate`, while `REGIONVII`, `REGIONXII` and `WD.AreaArea 8` have the largest negative contribution to `wd_rate`.
+
+
+## Lasso Regression
+
+In this section, we fit a lasso regression model, setting alpha to 1. Again, using cross validation:
+
+```{r}
+set.seed(1)
+cv_lasso_regression_model <- cv.glmnet(X_train, y_train, alpha=1)
+plot(cv_lasso_regression_model)
+```
+
+Based on 10-fold cross-validation, we find that a $\lambda=5.185112$ minimizes CV MSE.
+```{r}
+cv_lasso_regression_model$lambda.min
+```
+
+Further inspecting the model's path coefficients:
+
+```{r}
+plot(cv_lasso_regression_model$glmnet.fit, "lambda", label=FALSE)
+```
+
+We now test the performance of the lasso regression model:
+
+```{r}
+# Fit lasso regression model with optimal lambda
+optimal_lambda <- cv_lasso_regression_model$lambda.min
+lasso_regression_model <- glmnet(X_train, y_train, alpha=0, 
+                                 lambda = optimal_lambda)
+
+# Compute MSE
+predictions <- lasso_regression_model %>% 
+  predict(X_test) %>% as.vector()
+sqrt(mean((predictions - y_test)^2)) / (mean(y_test))
+```
+
+We find that our lasso regression model has a test RMSE of 0.2531856, outperforming the ridge regression model.
+
+```{r}
+lasso_regression_model_coefs <- lasso_regression_model %>% 
+  predict(type="coefficients", s=optimal_lambda) %>% as.matrix()
+lasso_regression_model_coefs[order(lasso_regression_model_coefs, 
+                                   decreasing=TRUE), ]
+```
+
+In terms of the resulting coefficients, we find that `REGIONIX`, `REGIONX`, `REGIONCARAGA` have the largest positive contribution to `wd_rate`, while `REGIONVII`, `WD.AreaArea 9` and `REGIONXII` have the largest negative contribution to `wd_rate`.
+
+## Principal Components Regression 
+
+In this section, we fit a principal components regression model to our data.
+
+```{r}
+set.seed(1)
+pcr_regression_model <- pcr(formulaConstructor(predictors), 
+                            data=df_train, scale=TRUE, validation="CV")
+pcr_regression_model %>% summary
+```
+
+We create a validation plot for our model to check the best number of components.
+
+```{r}
+validationplot(pcr_regression_model, val.type="RMSEP")
+```
+By plotting the validation plot over the number of components, we find that we can have minimal CV RMSEP at around 7 components.
+
+Checking the RMSE using 7 as the number of components:
+
+```{r}
+predictions <- predict(pcr_regression_model, df_test, ncomp=7) %>% as.vector()
+sqrt(mean((predictions - y_test)^2)) / (mean(y_test))
+```
+Based on our selected PCR model, we achieved 0.2668064 test RMSE.
+
+# Classification Problem
+
+## Ridge Regression
+
+Similar in the Regression Problem, we will also created a `formulaConstructor` for classification.
+
+```{r}
+formulaConstructor_c <- function(predictors) {
+  predictors %>% paste(collapse=" + ") %>% paste("nrwpcent_class ~", .) %>% as.formula()
+}
+
+grid <- 10^seq(10, -10, length=100)
+
+predictors_c <- df_train %>% 
+  select(-c(wd_rate, wd_rate_log, vol_nrw, vol_nrw_log, nrwpcent, 
+            nrwpcent_class)) %>% names()
+
+x_train_c <- model.matrix(formulaConstructor_c(predictors_c), df_train) 
+y_train_c <- df_train$nrwpcent_class
+
+x_test_c <- model.matrix(formulaConstructor_c(predictors_c), df_test)
+y_test_c <- df_test$nrwpcent_class
+set.seed(100)
+```
+
+We again find the best lambda for our model:
+
+
+```{r}
+
+cv_ridge_classification_model <- cv.glmnet(x_train_c, y_train_c, 
+                                           alpha=0, lambda = grid, family="binomial")
+plot(cv_ridge_classification_model)
+```
+
+We check the best lambda:
+
+```{r}
+cv_ridge_classification_model$lambda.min
+```
+Based on the above plot, we find that the optimal value of $\lambda$ is 0.1963041. Checking the number of coefficients against the log of lambda:
+
+```{r}
+plot(cv_ridge_classification_model$glmnet.fit, "lambda", label=FALSE)
+```
+
+We now evaluate our ridge classification model using the best lambda:
+
+```{r}
+# Fit ridge classification model with optimal lambda
+optimal_lambda_c <- cv_ridge_classification_model$lambda.min
+ridge_classification_model <- glmnet(x_train_c, y_train_c, alpha=0, 
+                                     lambda = optimal_lambda_c, family = "binomial")
+```
+
+To evaluate the performance of our model, we created a helper function that will plot the AUC of out model against the test set:
+
+```{r}
+AUCplotter <- function (classifier){
+cbind(rev(classifier$specificities), rev(classifier$sensitivities)) %>%
+  as.data.frame() %>%
+  rename('Specificity'=V1, 'Sensitivity'=V2) %>%
+  ggplot(aes(x=Specificity, y=Sensitivity)) +
+  geom_segment(aes(x = 0, y = 1, xend = 1,yend = 0), alpha = 0.5)  +
+  geom_step() +
+  scale_x_reverse(name = "Specificity",limits = c(1,0), expand = c(0.001,0.001)) +
+  scale_y_continuous(name = "Sensitivity", limits = c(0,1), expand = c(0.001, 0.001)) +
+  labs(title=paste("Area under the curve:", classifier$auc[1], sep=" ")) +
+  theme_minimal()
+}
+
+predictions <- ridge_classification_model %>% predict(x_test_c) %>% as.vector()
+roc_ridge <- roc(y_test_c, predictions)
+AUCplotter(roc_ridge)
+```
+
+Here, we see that the AUC is 0.533. We also evaluate its accuracy:
+
+```{r}
+confusionmatrix_creator <- function(model, x_test, y_test) {
+  predicted_probabilities <- model %>% predict(x_test)
+  predicted_probabilities[predicted_probabilities > 0.5] <- 1
+  predicted_probabilities[predicted_probabilities <= 0.5] <- 0
+  predicted_probabilities <- predicted_probabilities %>% as.vector() %>% as.factor
+  confusionMatrix(data=predicted_probabilities, reference = as.factor(y_test))
+}
+
+confusionmatrix_creator(ridge_classification_model, x_test_c, y_test_c)
+```
+
+Unfortunately, the accuracy of the Ridge Classification Model is only 48%.
+
+## Lasso Regression
+
+We now create a classification model using Lasso Regression. Again, we will just set alpha = 1. We use cross validation again to find an appropriate lambda for our model:
+
+```{r}
+set.seed(100)
+cv_lasso_classification_model <- cv.glmnet(x_train_c, y_train_c, 
+                                           lambda = grid, alpha=1, family="binomial")
+plot(cv_lasso_classification_model)
+```
+
+Check the minimim value we want:
+
+```{r}
+cv_lasso_classification_model$lambda.min
+```
+
+It appears that 0.03053856 is the best lambda for the Lasso model. Checking the coefficients vs. Log Lambda:
+
+```{r}
+plot(cv_lasso_classification_model$glmnet.fit, "lambda", label=FALSE)
+```
+
+
+Using our optimum lambda, we create our model.
+
+```{r}
+optimal_lambda_c <- cv_lasso_classification_model$lambda.min
+lasso_classification_model <- glmnet(x_train_c, y_train_c, 
+                                     lambda = optimal_lambda_c, 
+                                     alpha = 1, family = "binomial")
+```
+
+We now evaluate this model, checking the AUC:
+
+```{r}
+predictions <- lasso_classification_model %>% predict(x_test_c) %>% as.vector()
+roc_lasso <- roc(y_test_c, predictions)
+AUCplotter(roc_lasso)
+```
+
+The AUC for our Lasso Classification Model is 0.548. We now check the accuracy of our model:
+
+```{r}
+confusionmatrix_creator(lasso_classification_model, x_test_c, y_test_c)
+```
+
+Here, we see a better accuracy at 52%, compared to our ridge regression model.
+
+## Principal Components Regression
+
+Lastly, we create Principal Components Regression Classifier. We remove some of the components in our df_train based on previous work. We then use it to create our model:
+
+```{r}
+predictors_pcr <- df_train %>% 
+  select(-c(wd_rate, wd_rate_log, vol_nrw, vol_nrw_log, nrwpcent, 
+            nrwpcent_class, REGION, WD.Area, Mun1)) %>% names()
+
+set.seed(1)
+pcr_classification_model <- pcr(formulaConstructor_c(predictors_pcr), 
+                                data=df_dummies_train, scale=TRUE, 
+                                validation="CV", family = "binomial")
+
+pcr_classification_model %>% summary
+```
+
+To better visualize the best number of components, we use a validation plot:
+
+```{r}
+validationplot(pcr_classification_model, val.type="RMSEP")
+```
+
+Here we see that at around 6 number of components would be the best for our model. Using this, we fine tune our model and set the number of components to 6. We then evaluate its performance by checking its AUC:
+ 
+```{r}
+predictions <- predict(pcr_classification_model, df_dummies_test, 
+                       ncomp=6) %>% as.vector()
+roc_pcr <- roc(df_dummies_test$nrwpcent_class, predictions)
+AUCplotter(roc_pcr)
+```
+ 
+Here we see an AUC of 0.509. We check the accuracy of our model:
+
+```{r}
+  predicted_probabilities <- pcr_classification_model %>% 
+  predict(df_dummies_test, ncomp = 6)
+  predicted_probabilities[predicted_probabilities > 0.5] <- 1
+  predicted_probabilities[predicted_probabilities <= 0.5] <- 0
+  predicted_probabilities <- predicted_probabilities %>% 
+    as.vector() %>% as.factor
+  confusionMatrix(data=predicted_probabilities, 
+                  reference = as.factor(df_dummies_test$nrwpcent_class))
+```
+
+So far, the Principal Components Classifier has the highest accuracy.
+
+# Conclusions and Recommendations
+
+
+## Summary of Regression Models
+  
+For the regression problem, we have the following RMSE metrics:
+
+| **Model**                       |**RMSE**   | 
+|---------------------------------|-----------| 
+| Ridge Regression                | 0.267     | 
+| Lasso Regression                | 0.253     | 
+| Principal Components Regression | 0.268     | 
+
+For the classification problem, we have the following AUC and test accuracy metrics:
+
+| **Model**                       |**AUC**    |**Accuracy** | 
+|---------------------------------|-----------|-------------|
+| Ridge Regression                | 0.533     | 48%         |
+| Lasso Regression                | 0.545     | 52%         |
+| Principal Components Regression | 0.509     | 54%         |
+
+Based on test RMSE, we found the lasso model to have the best performance for the regression problem. For the classification problem, the best model is the Principal Components Regression Classifier with an accuracy of 54%. 
+
